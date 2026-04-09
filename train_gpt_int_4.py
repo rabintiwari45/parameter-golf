@@ -745,7 +745,7 @@ from torch import Tensor
 
 # ---------------- CONFIG ----------------
 GROUP_SIZE = 256
-OUTLIER_PERCENT = 0.2
+OUTLIER_PERCENT = 0.1
 INT8_KEEP_FLOAT_MAX_NUMEL = 4096
 
 # NF4 codebook (QLoRA-style)
