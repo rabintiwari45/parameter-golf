@@ -739,6 +739,375 @@ def dequantize_state_dict_int4(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+
+# ---------------- CONFIG ----------------
+GROUP_SIZE = 256
+OUTLIER_PERCENT = 0.2
+INT8_KEEP_FLOAT_MAX_NUMEL = 4096
+
+# NF4 codebook (QLoRA-style)
+NF4_CODEBOOK = torch.tensor([
+    -1.51, -1.18, -0.94, -0.77, -0.63, -0.51, -0.39, -0.28,
+     0.28,  0.39,  0.51,  0.63,  0.77,  0.94,  1.18,  1.51
+], dtype=torch.float32)
+
+
+# ---------------- UTILS ----------------
+def tensor_nbytes(t: Tensor) -> int:
+    return t.numel() * t.element_size()
+
+
+# ---------------- NF4 QUANT CORE ----------------
+def nf4_quantize(x: Tensor, scale: Tensor):
+    x_norm = x / scale
+    codebook = NF4_CODEBOOK.to(x.device)
+    dist = (x_norm.unsqueeze(-1) - codebook).abs()
+    idx = dist.argmin(dim=-1)
+    return idx.to(torch.uint8)
+
+
+def nf4_dequantize(idx: Tensor, scale: Tensor):
+    codebook = NF4_CODEBOOK.to(idx.device)
+    return codebook[idx.long()] * scale
+
+
+# ---------------- SCALE OPT ----------------
+def optimize_scale(x: Tensor, init_scale: Tensor):
+    best_scale = init_scale
+    best_err = float("inf")
+    for factor in torch.linspace(0.5, 1.5, steps=10):
+        scale = init_scale * factor
+        q = nf4_quantize(x, scale)
+        dq = nf4_dequantize(q, scale)
+        err = (x - dq).pow(2).mean()
+        if err < best_err:
+            best_err = err
+            best_scale = scale
+    return best_scale
+
+
+# ---------------- QUANTIZE TENSOR ----------------
+# def quantize_tensor_nf4(
+#     t: Tensor,
+#     group_size: int = GROUP_SIZE,
+#     outlier_percent: float = OUTLIER_PERCENT
+# ):
+#     t32 = t.float()
+#     orig_shape = list(t32.shape)
+
+#     if t32.ndim != 2:
+#         # fallback for 1D or scalar tensors
+#         scale = t32.abs().mean() + 1e-8
+#         idx = nf4_quantize(t32, scale)
+#         return idx, scale, orig_shape, None, None, 0
+
+#     rows, cols = t32.shape
+
+#     # ---- OUTLIER SPLIT ----
+#     threshold = torch.quantile(t32.abs(), 1 - outlier_percent)
+#     outlier_mask = t32.abs() > threshold
+#     outlier_values = t32[outlier_mask]
+#     t32_clean = t32.clone()
+#     t32_clean[outlier_mask] = 0.0
+
+#     # ---- PAD ----
+#     pad = (group_size - cols % group_size) % group_size
+#     if pad > 0:
+#         t32_clean = F.pad(t32_clean, (0, pad))
+
+#     new_cols = t32_clean.shape[1]
+
+#     # ---- GROUP ----
+#     grouped = t32_clean.reshape(rows, new_cols // group_size, group_size)
+
+#     # ---- SCALE INIT ----
+#     scale = grouped.abs().mean(dim=-1, keepdim=True) + 1e-8
+
+#     # ---- SCALE OPT ----
+#     scale = optimize_scale(grouped, scale)
+
+#     # ---- NF4 QUANT ----
+#     idx = nf4_quantize(grouped, scale)
+#     idx = idx.reshape(-1)
+
+#     return idx, scale.squeeze(), orig_shape, outlier_mask, outlier_values, pad
+
+def quantize_tensor_nf4(
+    t: Tensor,
+    group_size: int = GROUP_SIZE,
+    outlier_percent: float = OUTLIER_PERCENT
+):
+    t32 = t.float()
+    orig_shape = list(t32.shape)
+
+    if t32.ndim != 2:
+        scale = t32.abs().mean() + 1e-8
+        idx = nf4_quantize(t32, scale)
+        return idx, scale, orig_shape, None, None, None, 0
+
+    rows, cols = t32.shape
+
+    # ---- OUTLIER SPLIT ----
+    threshold = torch.quantile(t32.abs(), 1 - outlier_percent)
+    outlier_mask = t32.abs() > threshold
+
+    outlier_values = t32[outlier_mask]
+
+    # ---- INT8 QUANTIZE OUTLIERS ----
+    if outlier_values.numel() > 0:
+        outlier_scale = outlier_values.abs().max() / 127.0 + 1e-8
+        outlier_q = torch.clamp(
+            torch.round(outlier_values / outlier_scale),
+            -127, 127
+        ).to(torch.int8)
+    else:
+        outlier_q = torch.empty(0, dtype=torch.int8)
+        outlier_scale = torch.tensor(1.0, dtype=torch.float32)
+
+    # remove outliers from main tensor
+    t32_clean = t32.clone()
+    t32_clean[outlier_mask] = 0.0
+
+    # ---- PAD ----
+    pad = (group_size - cols % group_size) % group_size
+    if pad > 0:
+        t32_clean = F.pad(t32_clean, (0, pad))
+
+    new_cols = t32_clean.shape[1]
+
+    # ---- GROUP ----
+    grouped = t32_clean.reshape(rows, new_cols // group_size, group_size)
+
+    # ---- SCALE INIT ----
+    scale = grouped.abs().mean(dim=-1, keepdim=True) + 1e-8
+
+    # ---- SCALE OPT ----
+    scale = optimize_scale(grouped, scale)
+
+    # ---- NF4 QUANT ----
+    idx = nf4_quantize(grouped, scale)
+    idx = idx.reshape(-1)
+
+    return (
+        idx,
+        scale.squeeze(),
+        orig_shape,
+        outlier_mask,
+        outlier_q,
+        outlier_scale,
+        pad,
+    )
+
+
+# ---------------- PACK / UNPACK ----------------
+def pack_int4(idx: Tensor):
+    if idx.numel() % 2 != 0:
+        idx = F.pad(idx, (0, 1))
+    low = idx[0::2]
+    high = idx[1::2]
+    return (low | (high << 4)).to(torch.uint8)
+
+
+def unpack_int4(packed: Tensor):
+    low = packed & 0x0F
+    high = (packed >> 4) & 0x0F
+    out = torch.empty(packed.numel() * 2, dtype=torch.uint8)
+    out[0::2] = low
+    out[1::2] = high
+    return out
+
+
+# ---------------- STATE_DICT QUANTIZE ----------------
+# def quantize_state_dict_nf4(state_dict: dict[str, Tensor]):
+#     quantized = {}
+#     scales = {}
+#     shapes = {}
+#     outlier_masks = {}
+#     outlier_values = {}
+#     pads = {}
+#     dtypes = {}
+#     passthrough = {}
+
+#     for name, tensor in state_dict.items():
+#         t = tensor.detach().cpu()
+
+#         if not t.is_floating_point() or t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+#             passthrough[name] = t
+#             continue
+
+#         idx, scale, shape, mask, values, pad = quantize_tensor_nf4(t)
+#         packed = pack_int4(idx)
+
+#         quantized[name] = packed
+#         scales[name] = scale
+#         shapes[name] = shape
+#         pads[name] = pad
+#         dtypes[name] = str(t.dtype).removeprefix("torch.")
+
+#         if mask is not None:
+#             outlier_masks[name] = mask
+#             outlier_values[name] = values
+
+#     return {
+#         "quantized": quantized,
+#         "scales": scales,
+#         "shapes": shapes,
+#         "pads": pads,
+#         "outlier_masks": outlier_masks,
+#         "outlier_values": outlier_values,
+#         "dtypes": dtypes,
+#         "passthrough": passthrough,
+#     }
+
+
+# # ---------------- STATE_DICT DEQUANTIZE ----------------
+# def dequantize_state_dict_nf4(obj):
+#     out = {}
+
+#     for name, packed in obj["quantized"].items():
+#         scale = obj["scales"][name]
+#         shape = obj["shapes"][name]
+#         pad = obj["pads"].get(name, 0)
+#         dtype = getattr(torch, obj["dtypes"][name])
+
+#         idx = unpack_int4(packed)
+
+#         # ---- REMOVE PAD ----
+#         rows, cols = shape
+#         num_groups = (cols + pad) // GROUP_SIZE
+#         total_idx = rows * num_groups * GROUP_SIZE
+#         idx = idx[:total_idx]
+
+#         # ---- RESHAPE BACK TO GROUPED ----
+#         idx_grouped = idx.reshape(rows, num_groups, GROUP_SIZE)
+
+#         # ---- DEQUANTIZE ----
+#         scale_grouped = scale.unsqueeze(-1)  # shape: (rows, num_groups, 1)
+#         dq = NF4_CODEBOOK[idx_grouped.long()] * scale_grouped
+
+#         # ---- FLATTEN AND REMOVE PADDING ----
+#         dq = dq.reshape(rows, num_groups * GROUP_SIZE)
+#         if pad > 0:
+#             dq = dq[:, :cols]  # remove padded columns
+
+#         # ---- RESTORE OUTLIERS ----
+#         if name in obj["outlier_masks"]:
+#             mask = obj["outlier_masks"][name]
+#             values = obj["outlier_values"][name]
+#             dq[mask] = values
+
+#         out[name] = dq.to(dtype)
+
+#     # copy passthrough tensors
+#     for name, t in obj["passthrough"].items():
+#         out[name] = t
+
+#     return out
+
+def quantize_state_dict_nf4(state_dict: dict[str, Tensor]):
+    quantized = {}
+    scales = {}
+    shapes = {}
+    outlier_masks = {}
+    outlier_qs = {}
+    outlier_scales = {}
+    pads = {}
+    dtypes = {}
+    passthrough = {}
+
+    for name, tensor in state_dict.items():
+        t = tensor.detach().cpu()
+
+        if not t.is_floating_point() or t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            passthrough[name] = t
+            continue
+
+        (
+            idx,
+            scale,
+            shape,
+            mask,
+            outlier_q,
+            outlier_scale,
+            pad,
+        ) = quantize_tensor_nf4(t)
+
+        packed = pack_int4(idx)
+
+        quantized[name] = packed
+        scales[name] = scale
+        shapes[name] = shape
+        pads[name] = pad
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+
+        if mask is not None and outlier_q is not None:
+            outlier_masks[name] = mask
+            outlier_qs[name] = outlier_q
+            outlier_scales[name] = outlier_scale
+
+    return {
+        "quantized": quantized,
+        "scales": scales,
+        "shapes": shapes,
+        "pads": pads,
+        "outlier_masks": outlier_masks,
+        "outlier_qs": outlier_qs,
+        "outlier_scales": outlier_scales,
+        "dtypes": dtypes,
+        "passthrough": passthrough,
+    }
+
+def dequantize_state_dict_nf4(obj):
+    out = {}
+
+    for name, packed in obj["quantized"].items():
+        scale = obj["scales"][name]
+        shape = obj["shapes"][name]
+        pad = obj["pads"].get(name, 0)
+        dtype = getattr(torch, obj["dtypes"][name])
+
+        idx = unpack_int4(packed)
+
+        # ---- REMOVE PAD ----
+        rows, cols = shape
+        num_groups = (cols + pad) // GROUP_SIZE
+        total_idx = rows * num_groups * GROUP_SIZE
+        idx = idx[:total_idx]
+
+        # ---- RESHAPE BACK TO GROUPED ----
+        idx_grouped = idx.reshape(rows, num_groups, GROUP_SIZE)
+
+        # ---- DEQUANTIZE (NF4) ----
+        scale_grouped = scale.unsqueeze(-1)  # (rows, num_groups, 1)
+        dq = NF4_CODEBOOK[idx_grouped.long()] * scale_grouped
+
+        # ---- FLATTEN ----
+        dq = dq.reshape(rows, num_groups * GROUP_SIZE)
+
+        if pad > 0:
+            dq = dq[:, :cols]
+
+        # ---- RESTORE OUTLIERS (INT8) ----
+        if name in obj["outlier_masks"]:
+            mask = obj["outlier_masks"][name]
+            outlier_q = obj["outlier_qs"][name]
+            outlier_scale = obj["outlier_scales"][name]
+
+            outlier_values = outlier_q.float() * outlier_scale
+            dq[mask] = outlier_values
+
+        out[name] = dq.to(dtype)
+
+    # ---- PASSTHROUGH ----
+    for name, t in obj["passthrough"].items():
+        out[name] = t
+
+    return out
+
+
 # -----------------------------
 # DATA LOADING 
 # -----------------------------
@@ -1390,7 +1759,7 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int4(torch.load("final_model_backup.pt", map_location="cpu"))
+    quant_obj = quantize_state_dict_nf4(torch.load("final_model_backup.pt", map_location="cpu"))
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1401,11 +1770,11 @@ def main() -> None:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize("final_model.int4.ptz")
         code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int4_payload_bytes"], 1)
-        log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int4_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
-        )
+        # ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int4_payload_bytes"], 1)
+        # log0(
+        #     f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+        #     f"(payload:{quant_stats['int4_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+        # )
         log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
 
 
@@ -1415,7 +1784,7 @@ def main() -> None:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     # quant_state = torch.load("final_model_backup.pt", map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int4(quant_state), strict=True)
+    base_model.load_state_dict(dequantize_state_dict_nf4(quant_state), strict=True)
     # base_model.load_state_dict(quant_state, strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
