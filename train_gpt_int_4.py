@@ -56,7 +56,7 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
-    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 50.0))
+    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 5.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
@@ -789,52 +789,6 @@ def optimize_scale(x: Tensor, init_scale: Tensor):
     return best_scale
 
 
-# ---------------- QUANTIZE TENSOR ----------------
-# def quantize_tensor_nf4(
-#     t: Tensor,
-#     group_size: int = GROUP_SIZE,
-#     outlier_percent: float = OUTLIER_PERCENT
-# ):
-#     t32 = t.float()
-#     orig_shape = list(t32.shape)
-
-#     if t32.ndim != 2:
-#         # fallback for 1D or scalar tensors
-#         scale = t32.abs().mean() + 1e-8
-#         idx = nf4_quantize(t32, scale)
-#         return idx, scale, orig_shape, None, None, 0
-
-#     rows, cols = t32.shape
-
-#     # ---- OUTLIER SPLIT ----
-#     threshold = torch.quantile(t32.abs(), 1 - outlier_percent)
-#     outlier_mask = t32.abs() > threshold
-#     outlier_values = t32[outlier_mask]
-#     t32_clean = t32.clone()
-#     t32_clean[outlier_mask] = 0.0
-
-#     # ---- PAD ----
-#     pad = (group_size - cols % group_size) % group_size
-#     if pad > 0:
-#         t32_clean = F.pad(t32_clean, (0, pad))
-
-#     new_cols = t32_clean.shape[1]
-
-#     # ---- GROUP ----
-#     grouped = t32_clean.reshape(rows, new_cols // group_size, group_size)
-
-#     # ---- SCALE INIT ----
-#     scale = grouped.abs().mean(dim=-1, keepdim=True) + 1e-8
-
-#     # ---- SCALE OPT ----
-#     scale = optimize_scale(grouped, scale)
-
-#     # ---- NF4 QUANT ----
-#     idx = nf4_quantize(grouped, scale)
-#     idx = idx.reshape(-1)
-
-#     return idx, scale.squeeze(), orig_shape, outlier_mask, outlier_values, pad
-
 def quantize_tensor_nf4(
     t: Tensor,
     group_size: int = GROUP_SIZE,
@@ -851,10 +805,13 @@ def quantize_tensor_nf4(
     rows, cols = t32.shape
 
     # ---- OUTLIER SPLIT ----
-    threshold = torch.quantile(t32.abs(), 1 - outlier_percent)
+    threshold =  torch.quantile(t32.abs(), 1 - outlier_percent)
     outlier_mask = t32.abs() > threshold
 
+    # breakpoint()
+
     outlier_values = t32[outlier_mask]
+    # breakpoint()
 
     # ---- INT8 QUANTIZE OUTLIERS ----
     if outlier_values.numel() > 0:
@@ -919,93 +876,6 @@ def unpack_int4(packed: Tensor):
     out[1::2] = high
     return out
 
-
-# ---------------- STATE_DICT QUANTIZE ----------------
-# def quantize_state_dict_nf4(state_dict: dict[str, Tensor]):
-#     quantized = {}
-#     scales = {}
-#     shapes = {}
-#     outlier_masks = {}
-#     outlier_values = {}
-#     pads = {}
-#     dtypes = {}
-#     passthrough = {}
-
-#     for name, tensor in state_dict.items():
-#         t = tensor.detach().cpu()
-
-#         if not t.is_floating_point() or t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
-#             passthrough[name] = t
-#             continue
-
-#         idx, scale, shape, mask, values, pad = quantize_tensor_nf4(t)
-#         packed = pack_int4(idx)
-
-#         quantized[name] = packed
-#         scales[name] = scale
-#         shapes[name] = shape
-#         pads[name] = pad
-#         dtypes[name] = str(t.dtype).removeprefix("torch.")
-
-#         if mask is not None:
-#             outlier_masks[name] = mask
-#             outlier_values[name] = values
-
-#     return {
-#         "quantized": quantized,
-#         "scales": scales,
-#         "shapes": shapes,
-#         "pads": pads,
-#         "outlier_masks": outlier_masks,
-#         "outlier_values": outlier_values,
-#         "dtypes": dtypes,
-#         "passthrough": passthrough,
-#     }
-
-
-# # ---------------- STATE_DICT DEQUANTIZE ----------------
-# def dequantize_state_dict_nf4(obj):
-#     out = {}
-
-#     for name, packed in obj["quantized"].items():
-#         scale = obj["scales"][name]
-#         shape = obj["shapes"][name]
-#         pad = obj["pads"].get(name, 0)
-#         dtype = getattr(torch, obj["dtypes"][name])
-
-#         idx = unpack_int4(packed)
-
-#         # ---- REMOVE PAD ----
-#         rows, cols = shape
-#         num_groups = (cols + pad) // GROUP_SIZE
-#         total_idx = rows * num_groups * GROUP_SIZE
-#         idx = idx[:total_idx]
-
-#         # ---- RESHAPE BACK TO GROUPED ----
-#         idx_grouped = idx.reshape(rows, num_groups, GROUP_SIZE)
-
-#         # ---- DEQUANTIZE ----
-#         scale_grouped = scale.unsqueeze(-1)  # shape: (rows, num_groups, 1)
-#         dq = NF4_CODEBOOK[idx_grouped.long()] * scale_grouped
-
-#         # ---- FLATTEN AND REMOVE PADDING ----
-#         dq = dq.reshape(rows, num_groups * GROUP_SIZE)
-#         if pad > 0:
-#             dq = dq[:, :cols]  # remove padded columns
-
-#         # ---- RESTORE OUTLIERS ----
-#         if name in obj["outlier_masks"]:
-#             mask = obj["outlier_masks"][name]
-#             values = obj["outlier_values"][name]
-#             dq[mask] = values
-
-#         out[name] = dq.to(dtype)
-
-#     # copy passthrough tensors
-#     for name, t in obj["passthrough"].items():
-#         out[name] = t
-
-#     return out
 
 def quantize_state_dict_nf4(state_dict: dict[str, Tensor]):
     quantized = {}
@@ -1106,6 +976,225 @@ def dequantize_state_dict_nf4(obj):
         out[name] = t
 
     return out
+
+
+
+import torch
+import numpy as np
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+import torch
+import numpy as np
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+
+
+def profile_outliers_from_checkpoint(checkpoint_path, threshold_percentile=99.9):
+    """
+    Loads a saved model checkpoint from disk and profiles every weight matrix
+    for outliers that could degrade INT4 quantization quality.
+    """
+
+    # ------------------------------------------------------------------ #
+    #  Step 1 — Load the checkpoint                                        #
+    # ------------------------------------------------------------------ #
+    logger.info("=" * 60)
+    logger.info(f"Loading checkpoint from: '{checkpoint_path}'")
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+    # torch.save() can store either:
+    #   (a) a raw state_dict  → OrderedDict of {str: Tensor}
+    #   (b) a full object     → e.g. {"model": ..., "optimizer": ..., "epoch": ...}
+    # We handle both cases below.
+    if isinstance(checkpoint, dict) and not _is_state_dict(checkpoint):
+        # Case (b): wrapped checkpoint — look for the state dict inside
+        state_dict = _extract_state_dict(checkpoint)
+    else:
+        # Case (a): checkpoint IS the state dict
+        state_dict = checkpoint
+
+    total_keys   = len(state_dict)
+    matrix_keys  = [k for k, v in state_dict.items()
+                    if isinstance(v, torch.Tensor) and v.dim() >= 2]
+
+    logger.info(f"Checkpoint loaded successfully.")
+    logger.info(f"  Total keys in checkpoint : {total_keys}")
+    logger.info(
+        f"  Weight matrices (dim ≥ 2): {len(matrix_keys)}  "
+        f"← Only these will be profiled; biases and scalars are skipped."
+    )
+    logger.info("=" * 60)
+
+    # ------------------------------------------------------------------ #
+    #  Step 2 — Profile each weight matrix                                 #
+    # ------------------------------------------------------------------ #
+    outlier_report = {}
+    total_layers   = len(matrix_keys)
+
+    for idx, name in enumerate(matrix_keys, start=1):
+        param = state_dict[name]
+
+        logger.info(f"[{idx}/{total_layers}] Profiling layer: '{name}'")
+        logger.info(
+            f"  Shape: {list(param.shape)}  |  "
+            f"Total weights: {param.numel():,}"
+        )
+
+        w = param.detach().float()
+
+        # --- Absolute Maximum ---
+        abs_max = w.abs().max().item()
+        logger.info(
+            f"  Absolute max weight : {abs_max:.6f}  "
+            f"← The single largest weight value in this layer."
+        )
+
+        # --- 99.9th Percentile Threshold ---
+        p999 = np.percentile(w.abs().cpu().numpy(), threshold_percentile)
+        logger.info(
+            f"  {threshold_percentile}th percentile : {p999:.6f}  "
+            f"← Weights above this are outliers "
+            f"(top {100 - threshold_percentile:.1f}% of distribution)."
+        )
+
+        # --- Kurtosis ---
+        # Normal distribution ≈ 3. Values >> 3 mean heavy tails and many
+        # extreme weights, which are hard to represent in low-bit formats.
+        kurtosis_val = (
+            torch.mean((w - w.mean()) ** 4) / (torch.var(w) ** 2 + 1e-8)
+        ).item()
+        kurtosis_label = (
+            "⚠  Very heavy tails — high quantization risk"   if kurtosis_val > 10 else
+            "⚠  Moderately heavy tails — watch this layer"   if kurtosis_val > 5  else
+            "✓  Near-normal distribution — low risk"
+        )
+        logger.info(
+            f"  Kurtosis            : {kurtosis_val:.2f}  (normal ≈ 3.0)  "
+            f"← {kurtosis_label}"
+        )
+
+        # --- Dynamic Range ---
+        # max / mean_abs.  A very large ratio means a few huge values dominate
+        # the scale, causing small weights to lose precision after quantization.
+        mean_abs      = w.abs().mean().item()
+        dynamic_range = abs_max / (mean_abs + 1e-8)
+        range_label   = (
+            "⚠  Very wide — INT4 will likely clip small weights"  if dynamic_range > 100 else
+            "⚠  Moderate — some precision loss expected"          if dynamic_range > 20  else
+            "✓  Compact range — INT4 should handle this well"
+        )
+        logger.info(
+            f"  Dynamic range       : {dynamic_range:.1f}x  "
+            f"(max {abs_max:.4f} / mean {mean_abs:.4f})  "
+            f"← {range_label}"
+        )
+
+        # --- Outlier Ratio ---
+        outlier_ratio = (w.abs() > p999).float().mean().item()
+        logger.info(
+            f"  Outlier ratio       : {outlier_ratio * 100:.3f}%  "
+            f"← Expected ~{100 - threshold_percentile:.1f}% for a healthy distribution."
+        )
+
+        # --- Per-layer Risk & Recommendation ---
+        is_high_risk   = kurtosis_val > 10 or dynamic_range > 100
+        is_medium_risk = kurtosis_val > 5  or dynamic_range > 20
+        if is_high_risk:
+            rec = "🔴 HIGH RISK   — Keep in INT8 or apply SmoothQuant before INT4."
+        elif is_medium_risk:
+            rec = "🟡 MEDIUM RISK — Use smaller group size (64) or GPTQ compensation."
+        else:
+            rec = "🟢 LOW RISK    — Safe for standard INT4 with group size 128."
+        logger.info(f"  Recommendation      : {rec}")
+        logger.info("")
+
+        outlier_report[name] = {
+            "abs_max"       : abs_max,
+            f"p{threshold_percentile}": p999,
+            "kurtosis"      : kurtosis_val,
+            "dynamic_range" : dynamic_range,
+            "outlier_ratio" : outlier_ratio,
+            "risk"          : "high" if is_high_risk else "medium" if is_medium_risk else "low",
+        }
+
+    # ------------------------------------------------------------------ #
+    #  Step 3 — Final summary                                              #
+    # ------------------------------------------------------------------ #
+    high_risk   = [n for n, r in outlier_report.items() if r["risk"] == "high"]
+    medium_risk = [n for n, r in outlier_report.items() if r["risk"] == "medium"]
+    low_risk    = [n for n, r in outlier_report.items() if r["risk"] == "low"]
+
+    logger.info("=" * 60)
+    logger.info("PROFILING COMPLETE — SUMMARY")
+    logger.info("=" * 60)
+    logger.info(f"  🔴 High risk layers   : {len(high_risk)}   ← Must handle carefully (INT8 / SmoothQuant)")
+    logger.info(f"  🟡 Medium risk layers : {len(medium_risk)}   ← Benefit from smaller group size or GPTQ")
+    logger.info(f"  🟢 Low risk layers    : {len(low_risk)}   ← Safe for standard INT4 quantization")
+
+    if high_risk:
+        logger.info("")
+        logger.info("  High risk layers (check these first):")
+        for n in high_risk:
+            r = outlier_report[n]
+            logger.info(
+                f"    • {n}  "
+                f"(kurtosis={r['kurtosis']:.1f}, "
+                f"dynamic_range={r['dynamic_range']:.1f}x)"
+            )
+
+    logger.info("=" * 60)
+    return outlier_report
+
+
+# ------------------------------------------------------------------ #
+#  Helpers                                                             #
+# ------------------------------------------------------------------ #
+
+def _is_state_dict(d: dict) -> bool:
+    """
+    A state dict maps string keys directly to Tensors.
+    A wrapped checkpoint usually has non-Tensor values (epoch int, loss float, etc.)
+    """
+    return all(isinstance(v, torch.Tensor) for v in d.values())
+
+
+def _extract_state_dict(checkpoint: dict) -> dict:
+    """
+    Tries common keys used when saving a full training checkpoint.
+    Raises a clear error if none are found so the user knows exactly
+    what key to pass.
+    """
+    for key in ("model", "model_state_dict", "state_dict", "net", "network"):
+        if key in checkpoint:
+            logger.info(
+                f"  Wrapped checkpoint detected — "
+                f"extracting state dict from key: '{key}'"
+            )
+            return checkpoint[key]
+
+    logger.error(
+        "Could not find a state dict inside the checkpoint. "
+        f"Available keys: {list(checkpoint.keys())}. "
+        "Pass the correct key manually."
+    )
+    raise KeyError(
+        f"No recognised state-dict key found. "
+        f"Available keys: {list(checkpoint.keys())}"
+    )
+
 
 
 # -----------------------------
@@ -1758,6 +1847,7 @@ def main() -> None:
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+
 
     quant_obj = quantize_state_dict_nf4(torch.load("final_model_backup.pt", map_location="cpu"))
     quant_buf = io.BytesIO()
