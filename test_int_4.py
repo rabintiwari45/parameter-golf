@@ -787,14 +787,15 @@ from torch import Tensor
 
 # ---------------- CONFIG ----------------
 # BULK_QUANT_MODE:
-#   - "nf4" (default): 4-bit NF4 bulk + INT8 outliers — use for good BPB (~1.25–1.55 depending on group size).
-#   - "int2": 2-bit bulk + INT6 packed outliers — smallest file, much worse BPB (not for LM quality targets).
-BULK_QUANT_MODE = os.environ.get("BULK_QUANT_MODE", "nf4").strip().lower()
+#   - "int2" (default): 2-bit bulk (4-level codebook) + packed INT6 outliers.
+#   - "nf4": 4-bit NF4 bulk + INT8 outliers — better BPB (~1.25–1.55 depending on group size).
+#   - Override: OUTLIER_BITS=8 for int8 outliers (e.g. with int2 bulk).
+BULK_QUANT_MODE = os.environ.get("BULK_QUANT_MODE", "int2").strip().lower()
 USE_NF4_BULK = BULK_QUANT_MODE in ("nf4", "nf4_int8", "4bit", "int4")
 
 _default_gs = "64" if USE_NF4_BULK else "256"
-GROUP_SIZE = int(os.environ.get("INT2_GROUP_SIZE", os.environ.get("NF4_GROUP_SIZE", _default_gs)))
-OUTLIER_PERCENT = float(os.environ.get("INT2_OUTLIER_PERCENT", os.environ.get("NF4_OUTLIER_PERCENT", "0.15")))
+GROUP_SIZE = 256#  int(os.environ.get("INT2_GROUP_SIZE", os.environ.get("NF4_GROUP_SIZE", _default_gs)))
+OUTLIER_PERCENT = 0.032#float(os.environ.get("INT2_OUTLIER_PERCENT", os.environ.get("NF4_OUTLIER_PERCENT", "0.15")))
 # Per-row outlier mask: can hurt if mis-tuned; default off for NF4 (matches common PTQ), optional for int2.
 INT2_OUTLIER_PER_ROW = bool(int(os.environ.get("INT2_OUTLIER_PER_ROW", "0")))
 NF4_OUTLIER_PER_ROW = bool(int(os.environ.get("NF4_OUTLIER_PER_ROW", "0")))
@@ -806,7 +807,7 @@ GROUP_SCALE_DTYPE = os.environ.get(
 ).strip().lower()
 # Bit-pack outlier bool masks (8 weights/byte). Dense bool tensors blow up .pt size; same BPB.
 OUTLIER_MASK_PACKED = bool(int(os.environ.get("OUTLIER_MASK_PACKED", "1")))
-# 8 = INT8 outliers (recommended with nf4). 6 = packed INT6 (smaller outliers, worse tails).
+# 8 = INT8 outliers (default with nf4). 6 = packed INT6 (default with int2 bulk).
 OUTLIER_BITS = int(os.environ.get("OUTLIER_BITS", "8" if USE_NF4_BULK else "6"))
 INT8_KEEP_FLOAT_MAX_NUMEL = 4096
 
@@ -915,8 +916,8 @@ def quantize_tensor_nf4(
     outlier_percent: float = OUTLIER_PERCENT
 ):
     """
-    Bulk: NF4 (default) or INT2 via BULK_QUANT_MODE.
-    Outliers: INT8 (default with nf4) or INT6 via OUTLIER_BITS.
+    Bulk: INT2 (default) or NF4 via BULK_QUANT_MODE.
+    Outliers: INT6 default with int2 bulk; INT8 default with nf4; override via OUTLIER_BITS.
     """
     use_nf4 = USE_NF4_BULK
     q_bulk = nf4_quantize if use_nf4 else int2_quantize
@@ -1110,7 +1111,7 @@ def quantize_state_dict_nf4(state_dict: dict[str, Tensor]):
     qfmt = (
         ("nf4_int8_outlier_v2" if OUTLIER_BITS >= 8 else "nf4_int6_outlier_v1")
         if USE_NF4_BULK
-        else "int2_int6_outlier_v1"
+        else ("int2_int8_outlier_v2" if OUTLIER_BITS >= 8 else "int2_int6_outlier_v1")
     )
 
     for name, tensor in state_dict.items():
@@ -1229,7 +1230,7 @@ def dequantize_state_dict_nf4(obj):
             out[name] = dq.to(dtype)
             continue
 
-        if fmt in ("int2_bulk_int6_outlier_v1", "int2_int6_outlier_v1"):
+        if fmt in ("int2_bulk_int6_outlier_v1", "int2_int6_outlier_v1", "int2_int8_outlier_v2"):
             if len(shape) != 2:
                 n_w = int(torch.tensor(shape).prod().item())
                 idx_u = unpack_int2(packed, n_w).reshape(shape)
@@ -1254,8 +1255,11 @@ def dequantize_state_dict_nf4(obj):
                 outlier_packed = obj["outlier_qs"][name]
                 outlier_scale = _load_scale_tensor(obj["outlier_scales"][name])
                 n_o = int(mask.sum().item())
-                outlier_signed = unpack_outlier_int6_signed(outlier_packed, n_o)
-                outlier_values = outlier_signed.float() * outlier_scale
+                if outlier_packed.dtype == torch.int8:
+                    outlier_values = outlier_packed.float() * outlier_scale
+                else:
+                    outlier_signed = unpack_outlier_int6_signed(outlier_packed, n_o)
+                    outlier_values = outlier_signed.float() * outlier_scale
                 dq[mask] = outlier_values
 
             out[name] = dq.to(dtype)
@@ -2254,7 +2258,7 @@ def main() -> None:
     with open("final_model.int4.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(
-        io.BytesIO(decompress_quant_pickle_bytes(quant_blob_disk)), map_location="cpu"
+        io.BytesIO(decompress_quant_pickle_bytes(quant_blob_disk)), map_location="cpu", weights_only=False
     )
     # quant_state = torch.load("final_model_backup.pt", map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_nf4(quant_state), strict=True)
