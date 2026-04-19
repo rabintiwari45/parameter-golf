@@ -11,6 +11,92 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _quant_risk_from_tensor(w: torch.Tensor) -> tuple[float, float, str]:
+    """
+    Kurtosis, dynamic range (max abs / mean abs), and risk tier.
+    Same thresholds as the per-layer log lines below.
+    """
+    wf = w.detach().float()
+    kurtosis_val = (torch.mean((wf - wf.mean()) ** 4) / (torch.var(wf) ** 2 + 1e-8)).item()
+    abs_max = wf.abs().max().item()
+    mean_abs = wf.abs().mean().item()
+    dynamic_range = abs_max / (mean_abs + 1e-8)
+    if kurtosis_val > 10 or dynamic_range > 100:
+        risk = "high"
+    elif kurtosis_val > 5 or dynamic_range > 20:
+        risk = "medium"
+    else:
+        risk = "low"
+    return kurtosis_val, dynamic_range, risk
+
+
+def _log_int4_impact_and_int8_candidates(outlier_report: dict, state_dict: dict) -> None:
+    """
+    Risky layers are where INT4/NF4 is most likely to hurt quality. Among those,
+    prefer keeping *small* matrices in INT8: same protection with minimal size cost.
+    """
+    risky = [(n, r) for n, r in outlier_report.items() if r["risk"] in ("high", "medium")]
+    total_fp_numel = sum(
+        v.numel()
+        for v in state_dict.values()
+        if isinstance(v, torch.Tensor) and v.is_floating_point()
+    )
+    total_matrix_numel = sum(
+        r["numel"] for r in outlier_report.values()
+    )
+
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("INT4 QUALITY IMPACT + INT8 CANDIDATES (by parameter count)")
+    logger.info("=" * 60)
+    logger.info(
+        "Layers with medium/high risk are the ones INT4 is most likely to degrade. "
+        "Keeping a layer in INT8 typically costs ~1 byte/weight (+ scales); "
+        "smaller risky layers are the cheapest to protect."
+    )
+
+    if not risky:
+        logger.info("")
+        logger.info("  No medium/high-risk matrices — INT4 is unlikely to be the main quality limiter.")
+        logger.info("=" * 60)
+        return
+
+    risky_by_size = sorted(risky, key=lambda x: x[1]["numel"])
+    combined_risky_numel = sum(r["numel"] for _, r in risky)
+
+    logger.info("")
+    logger.info(
+        f"  Risky matrices (medium/high): {len(risky)} layers, "
+        f"{combined_risky_numel:,} weights "
+        f"({100.0 * combined_risky_numel / max(total_matrix_numel, 1):.2f}% of profiled 2D+ weights, "
+        f"{100.0 * combined_risky_numel / max(total_fp_numel, 1):.2f}% of all FP params)"
+    )
+    logger.info("")
+    logger.info("  Smallest risky layers first — best INT8 “bang for bytes” if you only protect a few:")
+    for n, r in risky_by_size:
+        b = r["storage_as_stored_bytes"]
+        int8_weight_bytes = r["numel"]  # symmetric INT8 payload only (ignores small scale overhead)
+        logger.info(
+            f"    • {n}"
+            f"  |  risk={r['risk']}"
+            f"  |  numel={r['numel']:,}"
+            f"  |  stored_now≈{b:,} B"
+            f"  |  rough INT8 weights≈{int8_weight_bytes:,} B"
+            f"  |  kurtosis={r['kurtosis']:.2f}"
+            f"  |  dyn_range={r['dynamic_range']:.1f}x"
+        )
+
+    largest = sorted(risky, key=lambda x: x[1]["numel"], reverse=True)
+    logger.info("")
+    logger.info("  Largest risky layers — move the most weights off INT4 if quality is still poor:")
+    for n, r in largest[: min(8, len(largest))]:
+        logger.info(
+            f"    • {n}  numel={r['numel']:,}  risk={r['risk']}"
+        )
+
+    logger.info("=" * 60)
+
+
 def load_checkpoint(checkpoint_input):
     """
     Accepts either:
@@ -136,10 +222,9 @@ def profile_outliers_from_checkpoint(checkpoint_input, threshold_percentile=99.9
             f"(top {100 - threshold_percentile:.1f}% of distribution)."
         )
 
-        # --- Kurtosis ---
-        kurtosis_val = (
-            torch.mean((w - w.mean()) ** 4) / (torch.var(w) ** 2 + 1e-8)
-        ).item()
+        # --- Kurtosis & dynamic range (single helper for metrics + risk) ---
+        kurtosis_val, dynamic_range, risk_level = _quant_risk_from_tensor(param)
+        mean_abs = w.abs().mean().item()
         kurtosis_label = (
             "⚠  Very heavy tails — high quantization risk"  if kurtosis_val > 10 else
             "⚠  Moderately heavy tails — watch this layer"  if kurtosis_val > 5  else
@@ -150,9 +235,6 @@ def profile_outliers_from_checkpoint(checkpoint_input, threshold_percentile=99.9
             f"← {kurtosis_label}"
         )
 
-        # --- Dynamic Range ---
-        mean_abs      = w.abs().mean().item()
-        dynamic_range = abs_max / (mean_abs + 1e-8)
         range_label   = (
             "⚠  Very wide — INT4 will likely clip small weights"  if dynamic_range > 100 else
             "⚠  Moderate — some precision loss expected"          if dynamic_range > 20  else
@@ -172,24 +254,26 @@ def profile_outliers_from_checkpoint(checkpoint_input, threshold_percentile=99.9
         )
 
         # --- Risk & Recommendation ---
-        is_high_risk   = kurtosis_val > 10 or dynamic_range > 100
-        is_medium_risk = kurtosis_val > 5  or dynamic_range > 20
-        if is_high_risk:
+        if risk_level == "high":
             rec = "🔴 HIGH RISK   — Keep in INT8 or apply SmoothQuant before INT4."
-        elif is_medium_risk:
+        elif risk_level == "medium":
             rec = "🟡 MEDIUM RISK — Use smaller group size (64) or GPTQ compensation."
         else:
             rec = "🟢 LOW RISK    — Safe for standard INT4 with group size 128."
         logger.info(f"  Recommendation      : {rec}")
         logger.info("")
 
+        numel = param.numel()
         outlier_report[name] = {
             "abs_max"                    : abs_max,
             f"p{threshold_percentile}"   : p999,
             "kurtosis"                   : kurtosis_val,
             "dynamic_range"              : dynamic_range,
             "outlier_ratio"              : outlier_ratio,
-            "risk"                       : "high" if is_high_risk else "medium" if is_medium_risk else "low",
+            "risk"                       : risk_level,
+            "numel"                      : numel,
+            "dtype"                      : str(param.dtype).removeprefix("torch."),
+            "storage_as_stored_bytes"    : numel * param.element_size(),
         }
 
     # ------------------------------------------------------------------ #
@@ -218,6 +302,9 @@ def profile_outliers_from_checkpoint(checkpoint_input, threshold_percentile=99.9
             )
 
     logger.info("=" * 60)
+
+    _log_int4_impact_and_int8_candidates(outlier_report, state_dict)
+
     return outlier_report
 
 
